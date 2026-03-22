@@ -1,0 +1,212 @@
+
+
+-- ============================================================================
+--
+-- 44_GeoServerSQLView.sql
+--
+-- Purpose  : Define the SQL View that GeoServer will use instead of querying
+--            my_mapdata directly.  This injects the two-phase geohash
+--            pre-filter so that GeoServer's BBOX queries hit a geohash
+--            index instead of doing a sequential scan.
+--
+-- Requires : 31_GeohashBboxFunctions.sql  (geohash_cells_for_bbox)
+--            11_CreateSchema.sql           (my_mapdata, indexes)
+--            20_GeohashFunctions.sql       (geohash_encode, geohash_adjacent)
+--
+-- ============================================================================
+--
+--
+-- WHAT THIS DOES
+-- ==============
+--
+-- GeoServer normally queries my_mapdata like this (from its PostGIS dialect):
+--
+--     SELECT ... FROM my_mapdata
+--     WHERE geom && ST_MakeEnvelope(xmin, ymin, xmax, ymax, 4326)
+--
+-- That produces a Seq Scan on all 344,688 rows because there is no GiST
+-- index (and YugabyteDB doesn't support GiST).
+--
+-- By configuring GeoServer to use a "SQL View" layer instead, we control the
+-- query.  GeoServer passes the bounding box via viewparams, and our SQL
+-- converts it to geohash cell lookups using LEFT(geo_hash10, 5), which
+-- hits ix_mapdata3.
+--
+-- Precision 5 is used because:
+--   - Each cell is ~2.4 miles wide, so a 25-mile bbox produces ~100 cells
+--   - It maps directly to ix_mapdata3: LEFT(geo_hash10, 5)
+--   - It handles any bbox from tiny to ~150 miles without exploding
+--
+-- For tighter queries (< 1 mile), the auto-precision overload of
+-- geohash_cells_for_bbox (no precision argument) can be used instead.
+-- It auto-selects precision 5, 6, or 8 based on bbox size.
+--
+--
+-- GEOSERVER PREREQUISITES
+-- =======================
+--
+-- GeoServer must be started with JSONP enabled so the HTML client
+-- (61_geoserver_map.html) can fetch data via a <script> tag from file:// URLs.
+-- This is configured in 60 - Start GeoServer.sh:
+--
+--   export JAVA_OPTS="${JAVA_OPTS} -DENABLE_JSONP=true"
+--
+-- The CORS filter in web.xml should also be uncommented (Jetty section):
+--
+--   /opt/geoserver/webapps/geoserver/WEB-INF/web.xml
+--
+--
+-- GEOSERVER CONFIGURATION STEPS
+-- ==============================
+--
+-- 1. Open GeoServer Web UI  http://localhost:8080/geoserver/web/?0
+--       (admin, geoserver)
+--
+-- 2. Create workspace (if not already done):
+--       Left panel -> Workspaces -> Add new workspace
+--          Name:              yugabyte
+--          URI:               http://yugabyte.local
+--          Default workspace: checked
+--          Save
+--
+-- 3. Create store (if not already done):
+--       Left panel -> Stores -> Add new store -> PostGIS
+--          Workspace:            yugabyte
+--          Data Source Name:     my_db33
+--          host:                 D1-Yuga-C6N1
+--          port:                 5433
+--          database:             my_db33
+--          schema:               public
+--          user:                 yugabyte
+--          passwd:               (blank)
+--          Expose primary keys:  checked
+--          Estimated extends:    checked
+--          Encode functions:     checked
+--          Loose bbox:           checked
+--          preparedStatements:   unchecked
+--          Save
+--
+-- 4. Create the SQL View layer:
+--       Left panel -> Layers -> Add a new layer
+--       Select yugabyte:my_db33 -> click "Configure new SQL view..."
+--
+-- 5. View Name:  my_mapdata_fast
+--
+-- 6. SQL Statement (paste this, no trailing semicolon):
+--
+--       SELECT
+--          md_pk,
+--          md_name,
+--          md_address,
+--          md_city,
+--          md_province,
+--          md_postcode,
+--          md_category,
+--          md_subcategory,
+--          geom
+--       FROM
+--          my_mapdata
+--       WHERE
+--          LEFT(geo_hash10, 5) = ANY(
+--             ARRAY(SELECT geohash_cells_for_bbox(
+--                cast(%LON_MIN% as numeric),
+--                cast(%LAT_MIN% as numeric),
+--                cast(%LON_MAX% as numeric),
+--                cast(%LAT_MAX% as numeric),
+--                5
+--             ))
+--          )
+--
+-- 7. Click "Guess parameters from SQL".  Four parameters appear.
+--    Configure them with tight defaults (Fort Collins area) so
+--    Refresh is fast:
+--
+--       Name      Default Value   Validation (regex)
+--       --------- --------------- ------------------
+--       LON_MIN   -105.09         ^-?[\d.]+$
+--       LAT_MIN   40.57           ^-?[\d.]+$
+--       LON_MAX   -105.06         ^-?[\d.]+$
+--       LAT_MAX   40.60           ^-?[\d.]+$
+--
+-- 8. Click "Refresh" next to "Attributes and types" to detect columns.
+--    Ensure that:
+--       - geom is recognized as Geometry, type Point, SRID 4326
+--       - md_pk is the identifier
+--
+-- 9. Click "Save", then publish the layer.
+--
+-- 10. Under "Bounding Boxes":
+--       Click "Compute from data"
+--       Click "Compute from native bounds"
+--
+-- 11. Save.
+--
+-- 12. Test via Layer Preview -> OpenLayers, or paste this in a browser:
+--
+--       http://localhost:8080/geoserver/yugabyte/wfs?service=WFS&version=1.0.0&request=GetFeature&typeName=yugabyte:my_mapdata_fast&outputFormat=application/json&maxFeatures=5&viewparams=LON_MIN:-105.09;LAT_MIN:40.57;LON_MAX:-105.06;LAT_MAX:40.60
+--
+--
+-- HOW THE CLIENT PASSES THE BBOX
+-- ===============================
+--
+-- The client (61_geoserver_map.html) passes the bounding box via
+-- the viewparams parameter in the WFS URL:
+--
+--   &viewparams=LON_MIN:-105.09;LAT_MIN:40.57;LON_MAX:-105.06;LAT_MAX:40.60
+--
+-- GeoServer substitutes these into the SQL View query before execution.
+-- The HTML uses JSONP (outputFormat=text/javascript, format_options=callback:...)
+-- to bypass CORS when loaded from a file:// URL.
+--
+--
+-- CQL_FILTER SUPPORT
+-- ==================
+--
+-- GeoServer appends CQL filters (e.g., md_name ILIKE '%Starbucks%')
+-- as additional WHERE conditions on top of the SQL View query.
+-- The geohash pre-filter already narrowed the rows, so the CQL filter
+-- only runs against the reduced candidate set.
+--
+--
+-- PERFORMANCE NOTES
+-- =================
+--
+-- The geohash_cells_for_bbox function walks the geohash grid cell by cell.
+-- At precision 5 (~2.4 mile cells), performance by bbox size:
+--
+--   ~1 mile bbox   ->  ~4 cells    -> fast (sub-second)
+--   ~5 mile bbox   ->  ~9 cells    -> fast
+--   ~25 mile bbox  ->  ~100 cells  -> moderate
+--   ~150 mile bbox ->  ~3600 cells -> slow (multiple seconds)
+--
+-- For very large bboxes, consider using precision 4 or a different
+-- approach entirely (e.g., return all data and filter client-side).
+--
+--
+-- ============================================================================
+-- VERIFICATION
+-- ============================================================================
+--
+-- Test the query directly in ysqlsh to confirm it uses the index:
+--
+-- EXPLAIN (ANALYZE, VERBOSE, DIST)
+-- SELECT
+--    md_pk, md_name, md_address, md_city, geom
+-- FROM
+--    my_mapdata
+-- WHERE
+--    LEFT(geo_hash10, 5) = ANY(
+--       ARRAY(SELECT geohash_cells_for_bbox(-105.09, 40.57, -105.06, 40.60, 5))
+--    );
+--
+-- Expected plan:
+--   Index Scan using ix_mapdata3 on my_mapdata  (~64ms, ~3,140 rows)
+--   (NOT Seq Scan)
+--
+-- IMPORTANT: = ANY(ARRAY(SELECT ...)) produces an Index Scan.
+--            IN (SELECT ...) produces a Hash Join -> Seq Scan.
+--            The planner treats these differently — always use = ANY(ARRAY(...)).
+
+
+
+

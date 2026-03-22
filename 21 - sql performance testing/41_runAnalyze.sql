@@ -1,0 +1,10 @@
+
+
+
+   ANALYZE my_mapdata;
+
+
+
+
+
+
